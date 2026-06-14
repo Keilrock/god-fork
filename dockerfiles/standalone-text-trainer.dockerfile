@@ -2,7 +2,8 @@ FROM axolotlai/axolotl:main-py3.11-cu124-2.5.1
 COPY --from=ghcr.io/astral-sh/uv:0.9.14 /uv /uvx /bin/
 
 ENV UV_SYSTEM_PYTHON=1 \
-    AXOLOTL_DO_NOT_TRACK=1
+    AXOLOTL_DO_NOT_TRACK=1 \
+    PYTHONPATH=/workspace:/workspace/axolotl/src
 
 # Core deps
 RUN uv pip install packaging setuptools wheel awscli pydantic \
@@ -14,6 +15,24 @@ RUN uv pip install packaging setuptools wheel awscli pydantic \
       git+https://github.com/huggingface/trl@07b4a84e0a3c8f37a2508fe177615af019782946
 
 RUN uv pip install --no-build-isolation vllm==0.10.2
+# open_spiel (provides pyspiel) — core/pvp drives pyspiel games for the PvP rollout.
+RUN uv pip install open_spiel==1.6.15
+# axolotl 0.11 pins transformers==4.53.1, but TRL @07b4a84e (needed for
+# trl.experimental.openenv.generate_rollout_completions) requires >=4.56.1.
+# 4.56.1 satisfies both: keeps AutoModelForVision2Seq, adds is_trackio_available,
+# and axolotl 0.11 doesn't reference the removed _flash_supports_window_size.
+RUN uv pip install "transformers==4.56.1"
+RUN uv pip uninstall flash_attn || pip uninstall -y flash_attn || true
+
+# transformers>=4.55 removed the private `_flash_supports_window_size` flag that
+# axolotl's ring-attention monkeypatch imports at module load. That code path
+# (sequence-parallel flash-attn) is never used here (single GPU, flash_attention:
+# false, flash_attn uninstalled), but the unconditional top-level import aborts
+# `axolotl.cli.train`. Make it fall back to False — disables sliding-window in a
+# path we don't execute.
+RUN sed -i \
+  's#^from transformers.modeling_flash_attention_utils import _flash_supports_window_size#try:\n    from transformers.modeling_flash_attention_utils import _flash_supports_window_size\nexcept ImportError:\n    _flash_supports_window_size = False#' \
+  /workspace/axolotl/src/axolotl/monkeypatch/ring_attn/patch.py
 
 WORKDIR /workspace/axolotl
 RUN mkdir -p /workspace/axolotl/configs \
@@ -22,6 +41,11 @@ RUN mkdir -p /workspace/axolotl/configs \
     /workspace/input_data 
 
 COPY dockerfiles/patches/axolotl_grpo_rollout_fix.py /workspace/axolotl/src/axolotl/core/trainers/grpo/__init__.py
+# axolotl 0.11's TRLConfig schema lacks rollout_func/vllm_mode/vllm_enable_sleep_mode,
+# so those config keys are dropped on validation (rollout never reaches the trainer,
+# vllm defaults to server mode). Inject the fields so they survive.
+COPY dockerfiles/patches/add_trl_schema_fields.py /tmp/add_trl_schema_fields.py
+RUN python3 /tmp/add_trl_schema_fields.py
 COPY dockerfiles/environment_functions/ /workspace/axolotl/src
 COPY core /workspace/core
 COPY miner /workspace/miner

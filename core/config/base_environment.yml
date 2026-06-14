@@ -61,7 +61,7 @@ resume_from_checkpoint:
 local_rank:
 logging_steps: 1
 xformers_attention:
-flash_attention: true
+flash_attention: false
 s2_attention:
 
 use_wandb: true
@@ -72,7 +72,7 @@ wandb_run: Gradients-Rollout
 wandb_runid: default
 
 eval_table_size:
-max_steps: 100000
+max_steps: 4
 warmup_steps: 25
 save_steps: 20
 save_total_limit: 1

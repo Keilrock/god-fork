@@ -49,16 +49,20 @@ class GRPOStrategy:
 
         if trl.use_vllm:
             grpo_args_kwargs["use_vllm"] = trl.use_vllm
-            if trl.vllm_mode:
-                grpo_args_kwargs["vllm_mode"] = trl.vllm_mode
-            if trl.vllm_mode == "colocate":
-                grpo_args_kwargs["vllm_enable_sleep_mode"] = trl.vllm_enable_sleep_mode  # type: ignore[attr-defined]
-                grpo_args_kwargs["vllm_gpu_memory_utilization"] = (
-                    vllm_cfg.gpu_memory_utilization
-                )
-                grpo_args_kwargs["vllm_tensor_parallel_size"] = (
-                    vllm_cfg.tensor_parallel_size
-                )
+            # axolotl 0.11's TRLConfig schema predates colocate and DROPS the
+            # `vllm_mode` / `vllm_enable_sleep_mode` keys during validation, so
+            # `trl.vllm_mode` is always None here and GRPOConfig would silently
+            # default to "server" (tries to reach `trl vllm-serve` at :8000 and
+            # times out after 240s). This pipeline is colocate-only by design,
+            # so force colocate and source its params from the vllm config.
+            grpo_args_kwargs["vllm_mode"] = "colocate"
+            grpo_args_kwargs["vllm_enable_sleep_mode"] = False
+            grpo_args_kwargs["vllm_gpu_memory_utilization"] = (
+                vllm_cfg.gpu_memory_utilization
+            )
+            grpo_args_kwargs["vllm_tensor_parallel_size"] = (
+                vllm_cfg.tensor_parallel_size
+            )
             grpo_args_kwargs["vllm_server_host"] = trl.vllm_server_host or trl.vllm.host  # type: ignore[attr-defined]
             grpo_args_kwargs["vllm_server_port"] = trl.vllm_server_port or trl.vllm.port  # type: ignore[attr-defined]
             if trl.vllm_server_timeout:
@@ -84,7 +88,7 @@ class GRPOStrategy:
         grpo_args_kwargs["log_completions"] = trl.log_completions
         grpo_args_kwargs["num_completions_to_print"] = trl.num_completions_to_print
 
-        if cfg.context_parallel_size > 1:
+        if cfg.context_parallel_size and cfg.context_parallel_size > 1:
             grpo_args_kwargs["context_parallel_size"] = cfg.context_parallel_size
 
         if trl.importance_sampling_level is not None:
