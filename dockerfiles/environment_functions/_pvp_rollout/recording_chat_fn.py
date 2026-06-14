@@ -53,6 +53,19 @@ def strip_think_tags(text: str) -> str:
     return cleaned.strip()
 
 
+def _scalarize(v):
+    """Coerce a tool-arg value to a JsonScalar (str/int/float/bool/None).
+
+    ToolCall.arguments is dict[str, JsonScalar]. Models sometimes emit nested
+    values (echoing the tool schema, common with richer action spaces like
+    othello). Non-scalars are JSON-encoded so ToolCall construction never raises
+    and any valid scalar keys (e.g. action_id) survive alongside the junk.
+    """
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return strip_think_tags(v) if isinstance(v, str) else v
+    return json.dumps(v, ensure_ascii=False)
+
+
 def _decode_arguments(raw) -> dict:
     if isinstance(raw, dict):
         return raw
@@ -122,9 +135,11 @@ def extract_tool_calls(text: str) -> list[ToolCall]:
             args = _decode_arguments(args)
         elif not isinstance(args, dict):
             args = {}
-        else:
-            args = {k: strip_think_tags(v) if isinstance(v, str) else v for k, v in args.items()}
-        calls.append(ToolCall(id=f"call_{i}", name=str(obj["name"]), arguments=args))
+        args = {str(k): _scalarize(v) for k, v in args.items()}
+        try:
+            calls.append(ToolCall(id=f"call_{i}", name=str(obj["name"]), arguments=args))
+        except Exception:  # noqa: BLE001 — never let a malformed call crash the rollout
+            continue
         i += 1
     return calls
 
