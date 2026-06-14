@@ -64,6 +64,64 @@ _OUTCOME_REWARD = {
 _GAMES_PER_MATCHUP = int(os.environ.get("PVP_GAMES_PER_MATCHUP", "2"))
 
 
+# --- Per-env terminal reward ---------------------------------------------------
+# Default: the binary WIN/DRAW/LOSS reward (mirrors the eval harness). Envs that
+# need a denser signal register a custom fn in _TERMINAL_REWARD_FNS. KEY: this
+# only changes the envs listed there — leduc/gin_rummy/liars_dice keep the proven
+# binary reward untouched.
+
+def _binary_reward(outcome: GameOutcome, state, model_seat: int) -> float:
+    return _OUTCOME_REWARD[outcome]
+
+
+def _disc_counts(state, seat: int) -> tuple[float, float]:
+    """(own, opp) disc counts from othello's terminal observation tensor.
+
+    observation_tensor(seat) is [3, 8, 8] flattened and PERSPECTIVE-RELATIVE
+    (verified): plane 0 = empty, plane 1 = own discs, plane 2 = opponent discs.
+    Plane size is derived (len // 3) rather than hard-coded to 64.
+    """
+    obs = state.observation_tensor(seat)
+    plane = len(obs) // 3
+    own = float(sum(obs[plane:2 * plane]))
+    opp = float(sum(obs[2 * plane:3 * plane]))
+    return own, opp
+
+
+# Level C reward shaping for othello. Its returns are binary +-1, so a 3B model
+# that loses to MCTS almost every game produces all-LOSS rollouts -> zero GRPO
+# advantage -> no gradient. Blend the binary outcome with the normalized disc
+# share so a narrow loss outscores a blowout and gradient survives even among
+# losses.  reward = 0.7 * outcome_binary + 0.3 * disc_share
+_OTHELLO_OUTCOME_WEIGHT = 0.7
+_OTHELLO_DISC_WEIGHT = 0.3
+
+
+def _othello_reward(outcome: GameOutcome, state, model_seat: int) -> float:
+    base = _OUTCOME_REWARD[outcome]
+    # disc_share is only meaningful at a terminal board. On a forfeit the game
+    # ended early (state not terminal) -> fall back to pure binary so we never
+    # reward bailing out early over playing a close game to the end.
+    if not state.is_terminal():
+        return base
+    own, opp = _disc_counts(state, model_seat)
+    total = own + opp
+    disc_share = 0.5 if total <= 0 else own / total  # neutral if board empty (guard div-by-zero)
+    reward = _OTHELLO_OUTCOME_WEIGHT * base + _OTHELLO_DISC_WEIGHT * disc_share
+    if _PVP_DBG:
+        print(
+            f"[PVP_DBG] othello game: outcome={outcome.name} discs={own:.0f}/{opp:.0f} "
+            f"share={disc_share:.3f} base={base} reward={reward:.3f}",
+            flush=True,
+        )
+    return reward
+
+
+_TERMINAL_REWARD_FNS = {
+    EnvironmentName.OTHELLO: _othello_reward,
+}
+
+
 def _chat_config_from_trainer(trainer) -> ChatCompletionConfig:
     """Build the ChatCompletionConfig the LLMBot needs. base_url/api_key are
     unused (generation goes through generate_rollout_completions, not HTTP), but
@@ -141,7 +199,8 @@ def _play_matchup(env_name: EnvironmentName, trainer, base_seed: int) -> tuple[T
                 max_utility=game.max_utility(),
             )
         )
-        rewards.append(_OUTCOME_REWARD[outcome])
+        reward_fn = _TERMINAL_REWARD_FNS.get(env_name, _binary_reward)
+        rewards.append(reward_fn(outcome, state, model_seat))
         if getattr(evaluation, "forfeit", False):
             any_forfeit = True
 
