@@ -5,6 +5,7 @@ Rules text is loaded from core/config/pvp_game_prompts.yml.
 """
 
 import functools
+import os
 import random
 import re
 from abc import ABC, abstractmethod
@@ -76,6 +77,14 @@ class BaseGameAgent(ABC):
         a bridge/trick bid)."""
         return state.action_to_string(player_id, action)
 
+    def select_actions(self, state: pyspiel.State, player_id: int, legal_actions: list[int]) -> list[int]:
+        """Which legal action ids to PRESENT to the model (prompt list + tool enum).
+        Default: all of them. Override per game when the full legal set is large
+        enough to overwhelm the model into summarising instead of acting (e.g.
+        liars_dice opens with 60 bids). The bot still validates the chosen move
+        against the FULL legal set, so narrowing only steers, never illegalises."""
+        return legal_actions
+
     def generate_system_prompt(self) -> str:
         prompts = load_prompts()
         return prompts["system_prompt_template"].format(
@@ -107,6 +116,24 @@ class LiarsDiceAgent(BaseGameAgent):
         if raw.strip().lower() == "liar":
             return "call Liar (challenge the previous bid as false)"
         return raw
+
+    # The opening turn exposes ~60 legal bids; presenting all of them pushes the
+    # model into "summarise the list" mode and it never emits a tool call. Show a
+    # small, strategically-sane subset instead: the lowest few bids (smallest
+    # quantity-then-face — the natural opening moves) plus "call Liar" whenever
+    # it's legal. The bot validates against the FULL legal set, so this only
+    # narrows what's shown, never what's allowed.
+    _LIARS_MENU_K = int(os.environ.get("LIARS_MENU_K", "12"))
+
+    def select_actions(self, state: pyspiel.State, player_id: int, legal_actions: list[int]) -> list[int]:
+        if len(legal_actions) <= self._LIARS_MENU_K:
+            return legal_actions
+        liar, bids = [], []
+        for a in legal_actions:
+            (liar if state.action_to_string(player_id, a).strip().lower() == "liar" else bids).append(a)
+        # action ids are ordered by (quantity, face); the lowest are the
+        # canonical opening raises. Keep the K lowest bids + always allow a call.
+        return sorted(bids)[: self._LIARS_MENU_K] + liar
 
     def generate_params(self, config_id: int) -> dict[str, int]:
         return {"players": 2, "numdice": 5}

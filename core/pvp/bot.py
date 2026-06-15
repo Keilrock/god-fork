@@ -185,13 +185,19 @@ class LLMBot(pyspiel.Bot):
         legal_actions = state.legal_actions(self._player_id)
         if not legal_actions:
             raise EmptyLegalActionsError(self._player_id)
-        legal_set = set(legal_actions)
+        legal_set = set(legal_actions)  # validation uses the FULL legal set
+
+        # What to PRESENT (prompt list + tool enum). Default is all legal actions;
+        # an agent may narrow it (e.g. liars_dice's 60-bid opening) to keep the
+        # model acting instead of summarising. Never illegalises — legal_set above
+        # still governs acceptance.
+        shown_actions = self._agent.select_actions(state, self._player_id, legal_actions)
 
         messages = [
             ChatMessage(role=ChatRole.SYSTEM, content=self._system_prompt()),
-            ChatMessage(role=ChatRole.USER, content=self._user_prompt(state, legal_actions)),
+            ChatMessage(role=ChatRole.USER, content=self._user_prompt(state, shown_actions)),
         ]
-        tools = self._memory_tools + [tool_lib.build_game_action_tool(self._legal_hint(legal_actions), legal_actions)]
+        tools = self._memory_tools + [tool_lib.build_game_action_tool(self._legal_hint(shown_actions), shown_actions)]
 
         result = self._chat(messages, tools)
 
