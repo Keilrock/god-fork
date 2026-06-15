@@ -7,6 +7,11 @@ system_prompt_template: >
 liars_dice_rules: >
   LIAR'S DICE RULES:
 
+  This is a DICE bluffing game — NOT a card, trick-taking, or bridge game. A bid
+  is (quantity, face value): a legal action shown as "quantity=N face=M" claims at
+  least N dice across all players show face M. Pick a legal action id and commit it
+  with the game_action tool.
+
   Setup: Each player has N dice (1-5 depending on variant). All players roll their dice secretly.
 
   Goal: Make bids about total dice across ALL players, or call "Liar" on opponent's bid.

@@ -259,7 +259,7 @@ class LLMBot(pyspiel.Bot):
 
     def _action_line(self, state: pyspiel.State, action: int) -> str:
         try:
-            return f"{action} -> {state.action_to_string(self._player_id, action)}"
+            return f"{action} -> {self._agent.describe_action(state, self._player_id, action)}"
         except (RuntimeError, AttributeError):
             return str(action)
 

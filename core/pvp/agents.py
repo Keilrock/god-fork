@@ -68,6 +68,14 @@ class BaseGameAgent(ABC):
                 f"information_state_string — override format_state() for this game"
             )
 
+    def describe_action(self, state: pyspiel.State, player_id: int, action: int) -> str:
+        """Human-readable label for a legal action id. Default: pyspiel's string.
+
+        Override per game when the native action string is ambiguous out of
+        context (e.g. liars_dice bids render as '1-1', which a model misreads as
+        a bridge/trick bid)."""
+        return state.action_to_string(player_id, action)
+
     def generate_system_prompt(self) -> str:
         prompts = load_prompts()
         return prompts["system_prompt_template"].format(
@@ -87,6 +95,18 @@ class LiarsDiceAgent(BaseGameAgent):
     @property
     def rules_key(self) -> str:
         return "liars_dice_rules"
+
+    def describe_action(self, state: pyspiel.State, player_id: int, action: int) -> str:
+        # pyspiel renders bids as "<quantity>-<face>" (e.g. "1-1") and the
+        # challenge as "Liar". Bare "1-1" reads like a bridge/trick bid; spell it
+        # out so the model treats it as a dice bid and calls game_action.
+        raw = state.action_to_string(player_id, action)
+        quantity, sep, face = raw.partition("-")
+        if sep and quantity.isdigit() and face.isdigit():
+            return f"bid: quantity={quantity} face={face} (claim at least {quantity} dice show face {face})"
+        if raw.strip().lower() == "liar":
+            return "call Liar (challenge the previous bid as false)"
+        return raw
 
     def generate_params(self, config_id: int) -> dict[str, int]:
         return {"players": 2, "numdice": 5}
