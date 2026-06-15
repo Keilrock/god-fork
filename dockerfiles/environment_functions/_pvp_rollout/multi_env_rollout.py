@@ -337,13 +337,24 @@ def make_multi_env_rollout(env_values: list[str]):
     Single-env (len 1) collapses to the same behaviour as make_rollout."""
     env_names = [EnvironmentName(v) for v in env_values]
     n_envs = len(env_names)
+    _intercode_rollout = None  # lazily built (avoids import cycle + asset load until used)
 
     def rollout_first_prompt_and_completion(prompts: list, trainer, max_turns: int = 30) -> dict[str, list]:
+        nonlocal _intercode_rollout
         idx = _step_index(trainer) % n_envs
         env_name = env_names[idx]
         if _PVP_DBG:
             print(f"[PVP_DBG] multi_env step env -> {env_name.value} "
                   f"(pool={[e.value for e in env_names]}, idx={idx})", flush=True)
+        # intercode is a different env-TYPE (NL2Bash LocalBashEnv, not a pyspiel
+        # LLMBot matchup) — route to its own rollout. Same return shape, so the
+        # GRPO group stays single-env (intercode reward [0.01,1] never mixes with
+        # PvP reward in one step).
+        if env_name == EnvironmentName.INTERCODE:
+            if _intercode_rollout is None:
+                from _pvp_rollout.intercode_rollout import make_intercode_rollout
+                _intercode_rollout = make_intercode_rollout()
+            return _intercode_rollout(prompts, trainer, max_turns)
         return _run_prompts_for_env(env_name, env_name.value, prompts, trainer)
 
     return rollout_first_prompt_and_completion

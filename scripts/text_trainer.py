@@ -120,13 +120,13 @@ def create_config(task_id, model, dataset, dataset_type, file_format, output_dir
         # GRPO group) and reads the full list from PVP_ENV_NAMES (propagated to the
         # accelerate subprocess via os.environ). Non-PvP envs (e.g. intercode) are
         # excluded here and handled by their own rollout.
-        pvp_envs = [
+        trainable_envs = [
             e for e in (dataset_type.environment_names or [])
-            if e is not None and ENVIRONMENT_CONFIGS[e].eval_type == EvalType.PVP
+            if e is not None and (ENVIRONMENT_CONFIGS[e].eval_type == EvalType.PVP or e.value == "intercode")
         ]
-        if pvp_envs:
-            os.environ["PVP_ENV_NAMES"] = ",".join(e.value for e in pvp_envs)
-            print(f"[text_trainer] PvP multi-env training on: {[e.value for e in pvp_envs]}", flush=True)
+        if trainable_envs:
+            os.environ["PVP_ENV_NAMES"] = ",".join(e.value for e in trainable_envs)
+            print(f"[text_trainer] multi-env training on: {[e.value for e in trainable_envs]}", flush=True)
             config["trl"]["rollout_func"] = "multi_env.rollout_first_prompt_and_completion"
             config["trl"]["reward_funcs"] = ["multi_env.rollout_reward_func"]
             config["trl"]["reward_weights"] = [1.0]

@@ -1,5 +1,29 @@
+# ── Stage: build InterCode NL2Bash fs snapshots (princeton-nlp/intercode).
+# Mirrors validator-intercode.dockerfile so the training fs == the eval fs.
+# Produces /intercode_fs/fs{1..4}.tar; data (queries/gold) at /opt/intercode/data/nl2bash.
+FROM ubuntu:22.04 AS intercode_fs
+ARG INTERCODE_COMMIT=c3e46d827cfc9d4c704ec078f7abf9f41e3191d8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash python3 psmisc bsdmainutils cron imagemagick dnsutils git tree \
+    net-tools iputils-ping coreutils curl cpio jq ca-certificates \
+    findutils gawk grep sed acl attr && \
+    rm -rf /var/lib/apt/lists/*
+RUN git clone https://github.com/princeton-nlp/intercode /opt/intercode && \
+    cd /opt/intercode && git checkout ${INTERCODE_COMMIT}
+COPY dockerfiles/intercode_build_fs.sh /opt/intercode-build/build_fs.sh
+RUN chmod +x /opt/intercode-build/build_fs.sh && /opt/intercode-build/build_fs.sh
+
+
 FROM axolotlai/axolotl:main-py3.11-cu124-2.5.1
 COPY --from=ghcr.io/astral-sh/uv:0.9.14 /uv /uvx /bin/
+
+# InterCode assets (NL2Bash fs snapshots + dataset). The rollout restores any
+# fs_{1,2,4} tar on demand; fs_3 (/workspace) is intentionally skipped in the
+# rollout so reset() never wipes the axolotl runtime under /workspace.
+COPY --from=intercode_fs /intercode_fs /intercode_fs
+COPY --from=intercode_fs /opt/intercode/data/nl2bash /intercode_data
+ENV INTERCODE_FS_ROOT=/intercode_fs \
+    INTERCODE_DATA_ROOT=/intercode_data
 
 ENV UV_SYSTEM_PYTHON=1 \
     AXOLOTL_DO_NOT_TRACK=1 \
