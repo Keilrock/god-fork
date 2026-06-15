@@ -328,24 +328,55 @@ def _step_index(trainer) -> int:
     return _step_index._fallback  # type: ignore[attr-defined]
 
 
+def _parse_env_weights() -> dict[str, int]:
+    """PVP_ENV_WEIGHTS='othello:2,gin_rummy:1' -> {'othello':2,'gin_rummy':1}.
+    Unset/blank -> {} (every env defaults to weight 1 = even round-robin)."""
+    raw = os.environ.get("PVP_ENV_WEIGHTS", "").strip()
+    weights: dict[str, int] = {}
+    for part in raw.split(","):
+        key, sep, val = part.partition(":")
+        if sep:
+            try:
+                weights[key.strip()] = max(1, int(val))
+            except ValueError:
+                pass
+    return weights
+
+
+def _build_schedule(env_names: list, weights: dict[str, int]) -> list:
+    """Per-step env schedule. Each env appears `weight` times per cycle, INTERLEAVED
+    round-by-round (a heavier env is spread across the cycle, not clustered) so the
+    1-env-per-step / single-env-per-GRPO-group invariant holds while a weighted env
+    simply recurs more often. Default (all weight 1) == the plain round-robin."""
+    w = {e: weights.get(e.value, 1) for e in env_names}
+    schedule = []
+    for r in range(max(w.values())):
+        for e in env_names:
+            if w[e] > r:
+                schedule.append(e)
+    return schedule
+
+
 def make_multi_env_rollout(env_values: list[str]):
-    """Build a multi-env rollout_func. ONE env is chosen per call (round-robin by
-    training step) and applied to EVERY prompt in that call, so all generations in
-    a GRPO group share an env — keeping advantage normalisation valid (reward
-    scales differ across envs). Different steps cover different envs.
+    """Build a multi-env rollout_func. ONE env is chosen per call (per training
+    step) and applied to EVERY prompt in that call, so all generations in a GRPO
+    group share an env — keeping advantage normalisation valid (reward scales
+    differ across envs). Env selection follows a weighted schedule (PVP_ENV_WEIGHTS);
+    by default every env is weight 1 == even round-robin.
 
     Single-env (len 1) collapses to the same behaviour as make_rollout."""
     env_names = [EnvironmentName(v) for v in env_values]
-    n_envs = len(env_names)
+    schedule = _build_schedule(env_names, _parse_env_weights())
+    n_sched = len(schedule)
     _intercode_rollout = None  # lazily built (avoids import cycle + asset load until used)
 
     def rollout_first_prompt_and_completion(prompts: list, trainer, max_turns: int = 30) -> dict[str, list]:
         nonlocal _intercode_rollout
-        idx = _step_index(trainer) % n_envs
-        env_name = env_names[idx]
+        idx = _step_index(trainer) % n_sched
+        env_name = schedule[idx]
         if _PVP_DBG:
             print(f"[PVP_DBG] multi_env step env -> {env_name.value} "
-                  f"(pool={[e.value for e in env_names]}, idx={idx})", flush=True)
+                  f"(schedule={[e.value for e in schedule]}, idx={idx})", flush=True)
         # intercode is a different env-TYPE (NL2Bash LocalBashEnv, not a pyspiel
         # LLMBot matchup) — route to its own rollout. Same return shape, so the
         # GRPO group stays single-env (intercode reward [0.01,1] never mixes with
