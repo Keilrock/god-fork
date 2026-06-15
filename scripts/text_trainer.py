@@ -114,10 +114,21 @@ def create_config(task_id, model, dataset, dataset_type, file_format, output_dir
         config["trl"]["reward_funcs"] = [f"{filename}.{func_name}" for func_name in reward_funcs_names]
         config["trl"]["reward_weights"] = [reward_function.reward_weight for reward_function in dataset_type.reward_functions]
     elif isinstance(dataset_type, EnvironmentDatasetType):
-        env = (dataset_type.environment_names or [None])[0]
-        if env is not None and ENVIRONMENT_CONFIGS[env].eval_type == EvalType.PVP:
-            config["trl"]["rollout_func"] = f"{env.value}.rollout_first_prompt_and_completion"
-            config["trl"]["reward_funcs"] = [f"{env.value}.rollout_reward_func"]
+        # Tournament env tasks are MULTI-env (R1=2, R2=4, R3=6) and the model is
+        # evaluated on every assigned env — so train on ALL assigned PvP envs, not
+        # just the first. The multi_env dispatcher rotates env per step (one env per
+        # GRPO group) and reads the full list from PVP_ENV_NAMES (propagated to the
+        # accelerate subprocess via os.environ). Non-PvP envs (e.g. intercode) are
+        # excluded here and handled by their own rollout.
+        pvp_envs = [
+            e for e in (dataset_type.environment_names or [])
+            if e is not None and ENVIRONMENT_CONFIGS[e].eval_type == EvalType.PVP
+        ]
+        if pvp_envs:
+            os.environ["PVP_ENV_NAMES"] = ",".join(e.value for e in pvp_envs)
+            print(f"[text_trainer] PvP multi-env training on: {[e.value for e in pvp_envs]}", flush=True)
+            config["trl"]["rollout_func"] = "multi_env.rollout_first_prompt_and_completion"
+            config["trl"]["reward_funcs"] = ["multi_env.rollout_reward_func"]
             config["trl"]["reward_weights"] = [1.0]
 
     if file_format != FileFormat.HF.value:

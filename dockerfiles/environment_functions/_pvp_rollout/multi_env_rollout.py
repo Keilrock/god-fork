@@ -241,68 +241,110 @@ def _play_matchup(env_name: EnvironmentName, trainer, base_seed: int) -> tuple[T
     return sink, mean_reward, any_forfeit
 
 
+def _run_prompts_for_env(env_name: "EnvironmentName", env_value: str, prompts: list, trainer) -> dict[str, list]:
+    """Play one matchup per prompt for a SINGLE env, return the GRPO trace dict.
+
+    Shared by the single-env and multi-env rollouts. The caller guarantees all
+    prompts in one call use the same env, so every completion in a GRPO group is
+    comparable (advantage normalisation stays valid across the group)."""
+    from trl.experimental.openenv import generate_rollout_completions
+
+    all_prompt_ids: list[list[int]] = []
+    all_completion_ids: list[list[int]] = []
+    all_logprobs: list[list[float]] = []
+    all_rewards: list[float] = []
+
+    base = random.randint(1, 2_000_000_000)
+
+    # --- debug instrumentation (smoke verification) ---
+    dbg_ok = 0
+    dbg_fallback = 0
+    dbg_forfeits = 0
+    dbg_turns: list[int] = []
+    dbg_tool_turns: list[int] = []
+    dbg_align_bad = 0
+
+    for n, prompt in enumerate(prompts):
+        try:
+            sink, reward, _forfeit = _play_matchup(env_name, trainer, base_seed=base + n)
+            if sink.captured and sink.completion_ids:
+                all_prompt_ids.append(sink.prompt_ids)
+                all_completion_ids.append(sink.completion_ids)
+                all_logprobs.append(sink.logprobs)
+                all_rewards.append(reward)
+                dbg_ok += 1
+                dbg_turns.append(sink.n_turns)
+                dbg_tool_turns.append(sink.n_tool_call_turns)
+                dbg_forfeits += int(bool(_forfeit))
+                dbg_align_bad += int(not sink.align_ok)
+                continue
+            # matchup produced no usable turn-0 trace: fall through to pad
+            raise RuntimeError("no turn-0 trace captured")
+        except Exception as e:  # noqa: BLE001 — trainer needs one entry per prompt
+            dbg_fallback += 1
+            print(f"[pvp_rollout:{env_value}] matchup failed ({e!r}); padding with plain completion", flush=True)
+            fb = generate_rollout_completions(trainer, prompts=[prompt])[0]
+            all_prompt_ids.append(fb.get("prompt_ids", []))
+            all_completion_ids.append(fb.get("completion_ids", []))
+            all_logprobs.append(fb.get("logprobs", []))
+            all_rewards.append(0.0)
+
+    if _PVP_DBG:
+        print(
+            f"[PVP_DBG] rollout {env_value}: prompts={len(prompts)} matchup_ok={dbg_ok} "
+            f"fallback={dbg_fallback} forfeits={dbg_forfeits} align_bad={dbg_align_bad} "
+            f"turns_per_matchup={dbg_turns} tool_call_turns={dbg_tool_turns} "
+            f"rewards={all_rewards} distinct_rewards={sorted(set(all_rewards))}",
+            flush=True,
+        )
+
+    return {
+        "prompt_ids": all_prompt_ids,
+        "completion_ids": all_completion_ids,
+        "logprobs": all_logprobs,
+        "env_rewards": all_rewards,
+    }
+
+
 def make_rollout(env_value: str):
-    """Build the rollout_func the trainer calls for env `env_value`."""
+    """Build a single-env rollout_func the trainer calls for env `env_value`."""
     env_name = EnvironmentName(env_value)
 
-    def rollout_first_prompt_and_completion(prompts: list[str], trainer, max_turns: int = 30) -> dict[str, list]:
-        from trl.experimental.openenv import generate_rollout_completions
+    def rollout_first_prompt_and_completion(prompts: list, trainer, max_turns: int = 30) -> dict[str, list]:
+        return _run_prompts_for_env(env_name, env_value, prompts, trainer)
 
-        all_prompt_ids: list[list[int]] = []
-        all_completion_ids: list[list[int]] = []
-        all_logprobs: list[list[float]] = []
-        all_rewards: list[float] = []
+    return rollout_first_prompt_and_completion
 
-        base = random.randint(1, 2_000_000_000)
 
-        # --- debug instrumentation (smoke verification) ---
-        dbg_ok = 0
-        dbg_fallback = 0
-        dbg_forfeits = 0
-        dbg_turns: list[int] = []
-        dbg_tool_turns: list[int] = []
-        dbg_align_bad = 0
+def _step_index(trainer) -> int:
+    """Monotonic step counter for env rotation. Prefers the trainer's global_step
+    (deterministic, resume-safe); falls back to a module-level call counter if the
+    trainer state isn't exposed."""
+    state = getattr(trainer, "state", None)
+    gs = getattr(state, "global_step", None)
+    if isinstance(gs, int):
+        return gs
+    _step_index._fallback = getattr(_step_index, "_fallback", -1) + 1  # type: ignore[attr-defined]
+    return _step_index._fallback  # type: ignore[attr-defined]
 
-        for n, prompt in enumerate(prompts):
-            try:
-                sink, reward, _forfeit = _play_matchup(env_name, trainer, base_seed=base + n)
-                if sink.captured and sink.completion_ids:
-                    all_prompt_ids.append(sink.prompt_ids)
-                    all_completion_ids.append(sink.completion_ids)
-                    all_logprobs.append(sink.logprobs)
-                    all_rewards.append(reward)
-                    dbg_ok += 1
-                    dbg_turns.append(sink.n_turns)
-                    dbg_tool_turns.append(sink.n_tool_call_turns)
-                    dbg_forfeits += int(bool(_forfeit))
-                    dbg_align_bad += int(not sink.align_ok)
-                    continue
-                # matchup produced no usable turn-0 trace: fall through to pad
-                raise RuntimeError("no turn-0 trace captured")
-            except Exception as e:  # noqa: BLE001 — trainer needs one entry per prompt
-                dbg_fallback += 1
-                print(f"[pvp_rollout:{env_value}] matchup failed ({e!r}); padding with plain completion", flush=True)
-                fb = generate_rollout_completions(trainer, prompts=[prompt])[0]
-                all_prompt_ids.append(fb.get("prompt_ids", []))
-                all_completion_ids.append(fb.get("completion_ids", []))
-                all_logprobs.append(fb.get("logprobs", []))
-                all_rewards.append(0.0)
 
+def make_multi_env_rollout(env_values: list[str]):
+    """Build a multi-env rollout_func. ONE env is chosen per call (round-robin by
+    training step) and applied to EVERY prompt in that call, so all generations in
+    a GRPO group share an env — keeping advantage normalisation valid (reward
+    scales differ across envs). Different steps cover different envs.
+
+    Single-env (len 1) collapses to the same behaviour as make_rollout."""
+    env_names = [EnvironmentName(v) for v in env_values]
+    n_envs = len(env_names)
+
+    def rollout_first_prompt_and_completion(prompts: list, trainer, max_turns: int = 30) -> dict[str, list]:
+        idx = _step_index(trainer) % n_envs
+        env_name = env_names[idx]
         if _PVP_DBG:
-            print(
-                f"[PVP_DBG] rollout {env_value}: prompts={len(prompts)} matchup_ok={dbg_ok} "
-                f"fallback={dbg_fallback} forfeits={dbg_forfeits} align_bad={dbg_align_bad} "
-                f"turns_per_matchup={dbg_turns} tool_call_turns={dbg_tool_turns} "
-                f"rewards={all_rewards} distinct_rewards={sorted(set(all_rewards))}",
-                flush=True,
-            )
-
-        return {
-            "prompt_ids": all_prompt_ids,
-            "completion_ids": all_completion_ids,
-            "logprobs": all_logprobs,
-            "env_rewards": all_rewards,
-        }
+            print(f"[PVP_DBG] multi_env step env -> {env_name.value} "
+                  f"(pool={[e.value for e in env_names]}, idx={idx})", flush=True)
+        return _run_prompts_for_env(env_name, env_name.value, prompts, trainer)
 
     return rollout_first_prompt_and_completion
 
