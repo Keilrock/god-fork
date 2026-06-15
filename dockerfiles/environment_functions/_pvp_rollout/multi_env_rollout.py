@@ -117,8 +117,41 @@ def _othello_reward(outcome: GameOutcome, state, model_seat: int) -> float:
     return reward
 
 
+# Level C reward shaping for gin_rummy. Unlike othello (binary +-1 returns),
+# gin_rummy's returns ARE the deadwood-based score margin (zero-sum, +-knock/gin
+# points), so we don't parse hands or reimplement a meld optimizer — pyspiel
+# hands us the margin. Blend the binary outcome with the normalized score margin
+# so a narrow loss (deadwood close to the opponent's = nearly knocked) outscores
+# a blowout (messy hand). margin_share parallels othello's disc_share: it is the
+# SAME normalization determine_outcome uses, so >0.5 win / <0.5 loss with the
+# magnitude carrying the margin.  reward = 0.7 * outcome_binary + 0.3 * margin_share
+_GIN_OUTCOME_WEIGHT = 0.7
+_GIN_MARGIN_WEIGHT = 0.3
+
+
+def _gin_rummy_reward(outcome: GameOutcome, state, model_seat: int) -> float:
+    base = _OUTCOME_REWARD[outcome]
+    # margin is only meaningful at a terminal hand. On a forfeit the game ended
+    # early (state not terminal) -> pure binary, same anti-forfeit rule as othello.
+    if not state.is_terminal():
+        return base
+    game = state.get_game()
+    lo, hi = game.min_utility(), game.max_utility()
+    player_return = state.returns()[model_seat]
+    margin_share = 0.5 if hi <= lo else (player_return - lo) / (hi - lo)
+    reward = _GIN_OUTCOME_WEIGHT * base + _GIN_MARGIN_WEIGHT * margin_share
+    if _PVP_DBG:
+        print(
+            f"[PVP_DBG] gin_rummy game: outcome={outcome.name} score={player_return:.0f} "
+            f"margin_share={margin_share:.3f} base={base} reward={reward:.3f}",
+            flush=True,
+        )
+    return reward
+
+
 _TERMINAL_REWARD_FNS = {
     EnvironmentName.OTHELLO: _othello_reward,
+    EnvironmentName.GIN_RUMMY: _gin_rummy_reward,
 }
 
 
