@@ -243,6 +243,14 @@ def make_recording_chat_fn(trainer, sink: TurnRecord):
         if tool_calls:
             sink.n_tool_call_turns += 1
 
+        if _PVP_DBG and sink.n_turns <= 1:  # first turn of each matchup: what did the model emit?
+            names = [tc.name for tc in (tool_calls or [])]
+            print(
+                f"[PVP_DBG] turn0 raw: n_tool_calls={len(tool_calls or [])} names={names} "
+                f"text[:280]={text[:280]!r}",
+                flush=True,
+            )
+
         return ChatResult(content=content, tool_calls=tool_calls, usage=None)
 
     return chat_fn
