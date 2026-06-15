@@ -78,16 +78,88 @@ def _decode_arguments(raw) -> dict:
         return {}
 
 
-def extract_tool_calls(text: str) -> list[ToolCall]:
-    """Pull tool calls from Qwen-style <tool_call> blocks (brace-balanced).
+def _balanced_json_end(text: str, brace: int) -> int:
+    """Index of the closing `}` matching the `{` at `brace` (string-aware), or -1."""
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(brace, len(text)):
+        ch = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
 
-    Qwen emits `<tool_call>\\n{json}` and does NOT reliably close with
-    </tool_call> (and may stack several). Locate each <tool_call>, extract the
-    following JSON object by brace-balancing (handles nested 'arguments'),
-    independent of any closing tag. Malformed blocks are skipped, never raised.
+
+def _obj_to_toolcall(obj, idx: int) -> "ToolCall | None":
+    """Build a ToolCall from a parsed JSON dict across the formats the whitelisted
+    models actually emit. Returns None for non-calls/malformed.
+
+    Shapes handled:
+      Qwen:           {"name": ..., "arguments": {...}}
+      Llama bare:     {"name": ..., "parameters": {...}}
+      Llama wrapped:  {"type":"function","function":{"name":...,"parameters":{...}}}
+      Llama variant:  {"function":"name", "parameters":{...}}
+    Args may be under 'arguments' or 'parameters', on the name-holder or top level.
+    """
+    if not isinstance(obj, dict):
+        return None
+    fn = obj.get("function")
+    if isinstance(fn, dict):              # wrapped: {"function": {"name":..., ...}}
+        name = fn.get("name")
+        args = fn.get("arguments")
+        if args is None:
+            args = fn.get("parameters")
+    elif isinstance(fn, str):            # {"function": "name", "parameters": {...}}
+        name = fn
+        args = None
+    else:                                # bare: name at top level
+        name = obj.get("name")
+        args = None
+    if args is None:                     # fall back to top-level args
+        args = obj.get("arguments")
+    if args is None:
+        args = obj.get("parameters")
+    if not name:
+        return None
+    if isinstance(args, str):
+        args = _decode_arguments(args)
+    elif not isinstance(args, dict):
+        args = {}
+    args = {str(k): _scalarize(v) for k, v in args.items()}
+    try:
+        return ToolCall(id=f"call_{idx}", name=str(name), arguments=args)
+    except Exception:  # noqa: BLE001 — never let a malformed call crash the rollout
+        return None
+
+
+def extract_tool_calls(text: str) -> list[ToolCall]:
+    """Parse tool calls from a completion, handling every whitelisted model family:
+
+    - Qwen2.5/Qwen3 + Hermes: `<tool_call>\\n{json}` blocks (json has 'arguments'),
+      tolerant of a missing </tool_call>, possibly stacked.
+    - Llama-3.1/3.2: bare `{"name":..., "parameters":...}` (no tags; the
+      <|python_tag|> prefix is already stripped by skip_special_tokens at decode).
+
+    Brace-balanced + string-aware; malformed blobs are skipped, never raised.
     """
     calls: list[ToolCall] = []
     i = 0
+
+    # Path A: <tool_call>-delimited blocks (Qwen / Hermes).
     idx = 0
     tag = "<tool_call>"
     while True:
@@ -97,50 +169,41 @@ def extract_tool_calls(text: str) -> list[ToolCall]:
         brace = text.find("{", start + len(tag))
         if brace == -1:
             break
-        depth = 0
-        end = -1
-        in_str = False
-        esc = False
-        for j in range(brace, len(text)):
-            ch = text[j]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-                continue
-            if ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = j
-                    break
+        end = _balanced_json_end(text, brace)
         if end == -1:
             break
-        blob = text[brace:end + 1]
         idx = end + 1
         try:
-            obj = json.loads(blob)
+            obj = json.loads(text[brace:end + 1])
         except json.JSONDecodeError:
             continue
-        if not isinstance(obj, dict) or "name" not in obj:
-            continue
-        args = obj.get("arguments", {})
-        if isinstance(args, str):
-            args = _decode_arguments(args)
-        elif not isinstance(args, dict):
-            args = {}
-        args = {str(k): _scalarize(v) for k, v in args.items()}
+        tc = _obj_to_toolcall(obj, i)
+        if tc is not None:
+            calls.append(tc)
+            i += 1
+    if calls:
+        return calls
+
+    # Path B: no <tool_call> tags -> scan for bare JSON objects with a "name"
+    # key (Llama-3.x format). Objects without "name" are skipped, so stray JSON
+    # in the text doesn't produce false calls.
+    scan = 0
+    while True:
+        brace = text.find("{", scan)
+        if brace == -1:
+            break
+        end = _balanced_json_end(text, brace)
+        if end == -1:
+            break
+        scan = end + 1
         try:
-            calls.append(ToolCall(id=f"call_{i}", name=str(obj["name"]), arguments=args))
-        except Exception:  # noqa: BLE001 — never let a malformed call crash the rollout
+            obj = json.loads(text[brace:end + 1])
+        except json.JSONDecodeError:
             continue
-        i += 1
+        tc = _obj_to_toolcall(obj, i)
+        if tc is not None:
+            calls.append(tc)
+            i += 1
     return calls
 
 
@@ -155,7 +218,7 @@ class TurnRecord:
     n_turns: int = 0            # total chat_fn calls this matchup
     n_tool_call_turns: int = 0  # turns where the model emitted >=1 parsed tool_call
     tools_in_prompt: bool = False   # tool schemas were rendered into the prompt text
-    render_tpl_qwen: bool = True    # render tokenizer had the native Qwen tool template
+    render_tpl_native: bool = False  # render tokenizer used the model's native (family) tool template
     align_ok: bool = True       # captured turn: len(completion_ids)==len(logprobs)
 
 
@@ -175,22 +238,23 @@ def make_recording_chat_fn(trainer, sink: TurnRecord):
 
     # Render prompts with the model's NATIVE chat template. axolotl overrides
     # trainer.processing_class.chat_template per config (chat_template: llama3),
-    # which does NOT emit Qwen's <tool_call> tool-calling format. A fresh
-    # tokenizer loaded from the model dir keeps the native Qwen template (same
-    # vocab, so token ids stay consistent). generate_rollout_completions has no
-    # `tools=` arg, so we bake the tool schemas into the prompt text via this
-    # template ourselves.
+    # which won't emit the model's real tool-calling format. A fresh tokenizer
+    # from the model dir keeps the native template (same vocab → token ids stay
+    # consistent). Family-agnostic: any whitelisted model (Qwen <tool_call>,
+    # Llama bare-JSON, Hermes) renders its own format here; extract_tool_calls
+    # parses all of them. generate_rollout_completions has no `tools=` arg, so we
+    # bake the tool schemas into the prompt text via apply_chat_template(tools=).
     render_tokenizer = tokenizer
-    render_tpl_qwen = bool(getattr(tokenizer, "chat_template", None) and "tool_call" in tokenizer.chat_template)
+    render_tpl_native = False
     try:
         model_path = getattr(tokenizer, "name_or_path", None)
         if model_path:
             cand = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            if cand.chat_template and "tool_call" in cand.chat_template:
+            if cand.chat_template:  # native template (renders this family's tool format)
                 render_tokenizer = cand
-                render_tpl_qwen = True
+                render_tpl_native = True
             elif _PVP_DBG:
-                print(f"[PVP_DBG] render tokenizer from {model_path} lacks tool_call template", flush=True)
+                print(f"[PVP_DBG] render tokenizer from {model_path} has no chat_template", flush=True)
     except Exception as e:  # noqa: BLE001
         if _PVP_DBG:
             print(f"[PVP_DBG] render tokenizer load failed ({e!r}); using trainer tokenizer", flush=True)
@@ -202,7 +266,7 @@ def make_recording_chat_fn(trainer, sink: TurnRecord):
     ) -> ChatResult:
         wire_messages = [m.to_openai() for m in messages]
         sink.n_turns += 1
-        sink.render_tpl_qwen = render_tpl_qwen
+        sink.render_tpl_native = render_tpl_native
 
         if tools:
             # Render the tool schemas INTO the prompt text (Qwen template), then
@@ -232,7 +296,7 @@ def make_recording_chat_fn(trainer, sink: TurnRecord):
                     f"[PVP_DBG] capture turn0: prompt_ids={len(sink.prompt_ids)} "
                     f"completion_ids={len(sink.completion_ids)} logprobs={len(sink.logprobs)} "
                     f"align={sink.align_ok} tools_in_prompt={sink.tools_in_prompt} "
-                    f"render_tpl_qwen={sink.render_tpl_qwen}",
+                    f"render_tpl_native={sink.render_tpl_native}",
                     flush=True,
                 )
 
