@@ -2,7 +2,7 @@
 # Start vLLM OpenAI server (Qwen2.5 hermes tool parser), wait healthy, run othello eval.
 # Args: MODEL_PATH SERVED_NAME TOKENIZER NUM_GAMES MCTS_SIMS LORA_PATH(optional)
 set -e
-MODEL_PATH="$1"; SERVED_NAME="$2"; TOKENIZER="$3"; NUM_GAMES="$4"; MCTS_SIMS="$5"; LORA_PATH="$6"
+MODEL_PATH="$1"; SERVED_NAME="$2"; TOKENIZER="$3"; NUM_GAMES="$4"; MCTS_SIMS="$5"; LORA_PATH="$6"; TEMP="${7:-0.0}"
 LORA_ARGS=""
 if [ -n "$LORA_PATH" ]; then
   LORA_ARGS="--enable-lora --lora-modules ${SERVED_NAME}=${LORA_PATH} --max-lora-rank 64"
@@ -23,5 +23,5 @@ for i in $(seq 1 90); do
   sleep 10
 done
 python3 /workspace/othello_eval.py --model "$INFER_NAME" --tokenizer "$TOKENIZER" \
-  --num-games "$NUM_GAMES" --mcts-sims "$MCTS_SIMS" --base-seed 0 --time-budget 3000
+  --num-games "$NUM_GAMES" --mcts-sims "$MCTS_SIMS" --base-seed 0 --temperature "$TEMP" --time-budget 3000
 kill $VLLM_PID 2>/dev/null || true

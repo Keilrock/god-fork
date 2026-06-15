@@ -51,6 +51,7 @@ def main():
     ap.add_argument("--num-games", type=int, default=20)
     ap.add_argument("--mcts-sims", type=int, default=None, help="override MCTS strength")
     ap.add_argument("--base-seed", type=int, default=0)
+    ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--time-budget", type=float, default=None)
     args = ap.parse_args()
 
@@ -64,7 +65,7 @@ def main():
         inference_model=args.model,
         tokenizer_repo=args.tokenizer,
         base_url=args.base_url,
-        temperature=0.0,
+        temperature=args.temperature,
         seed=0,
         max_tokens=cst.PVP_TURN_MAX_TOKENS,
         max_retries=3,
